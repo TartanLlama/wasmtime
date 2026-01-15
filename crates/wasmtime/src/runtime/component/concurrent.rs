@@ -686,6 +686,8 @@ enum WorkItem {
     PushFuture(AlwaysMut<HostTaskFuture>),
     /// A fiber to resume.
     ResumeFiber(StoreFiber<'static>),
+    /// A thread to resume.
+    ResumeThread(QualifiedThreadId),
     /// A pending call into guest code for a given guest task.
     GuestCall(GuestCall),
     /// A job to run on a worker fiber.
@@ -1548,13 +1550,14 @@ impl StoreOpaque {
                     }
                 }
                 SuspendReason::Yielding { thread, .. } => {
-                    state.get_mut(thread.thread)?.state = GuestThreadState::Pending;
-                    state.push_low_priority(WorkItem::ResumeFiber(fiber));
+                    state.get_mut(thread.thread)?.state = GuestThreadState::Pending(fiber);
+                    state.push_low_priority(WorkItem::ResumeThread(thread));
                 }
                 SuspendReason::ExplicitlySuspending { thread, .. } => {
                     state.get_mut(thread.thread)?.state = GuestThreadState::Suspended(fiber);
                 }
                 SuspendReason::Waiting { set, thread, .. } => {
+                    state.get_mut(thread.thread)?.state = GuestThreadState::Waiting;
                     let old = state
                         .get_mut(set)?
                         .waiting
@@ -3240,8 +3243,23 @@ impl Instance {
                     .concurrent_state_mut()
                     .push_work_item(WorkItem::ResumeFiber(fiber), high_priority);
             }
+            GuestThreadState::Pending(fiber) => {
+                log::trace!("resuming thread {thread_id:?} that was pending");
+                // If we're resuming a pending thread as low-priority, there's nothing to do,
+                // as it'll eventually be resumed anyway. But if we're resuming it as high-priority,
+                // we need to promote the existing resume task to high-priority.
+                if high_priority {
+                    store
+                        .concurrent_state_mut()
+                        .promote_thread_resume_to_high_priority(guest_thread, fiber);
+                }
+            }
+            GuestThreadState::Waiting => {
+                log::trace!("resuming thread {thread_id:?} that was waiting");
+                // Resuming a thread that is waiting is a no-op; it will resume when the wait completes.
+            }
             _ => {
-                bail!("cannot resume thread which is not suspended");
+                bail!("cannot resume thread which is completed or already running");
             }
         }
         Ok(())
@@ -4199,7 +4217,8 @@ enum GuestThreadState {
     ),
     Running,
     Suspended(StoreFiber<'static>),
-    Pending,
+    Pending(StoreFiber<'static>),
+    Waiting,
     Completed,
 }
 pub struct GuestThread {
@@ -4823,10 +4842,11 @@ impl ConcurrentState {
                     }
                 }
             } else if let Some(thread) = entry.downcast_mut::<GuestThread>() {
-                if let GuestThreadState::Suspended(fiber) =
-                    mem::replace(&mut thread.state, GuestThreadState::Completed)
-                {
-                    fibers.push(fiber);
+                match mem::replace(&mut thread.state, GuestThreadState::Completed) {
+                    GuestThreadState::Suspended(fiber) | GuestThreadState::Pending(fiber) => {
+                        fibers.push(fiber);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -4872,6 +4892,21 @@ impl ConcurrentState {
             }
         }
         ready
+    }
+
+    fn promote_thread_resume_to_high_priority(
+        &mut self,
+        thread: QualifiedThreadId,
+        fiber: StoreFiber<'static>,
+    ) {
+        self.low_priority.retain(|item| {
+            if let &WorkItem::ResumeThread(t) = item {
+                t != thread
+            } else {
+                true
+            }
+        });
+        self.push_high_priority(WorkItem::ResumeFiber(fiber));
     }
 
     fn push<V: Send + Sync + 'static>(
