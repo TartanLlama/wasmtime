@@ -699,6 +699,7 @@ impl fmt::Debug for WorkItem {
         match self {
             Self::PushFuture(_) => f.debug_tuple("PushFuture").finish(),
             Self::ResumeFiber(_) => f.debug_tuple("ResumeFiber").finish(),
+            Self::ResumeThread(thread) => f.debug_tuple("ResumeThread").field(thread).finish(),
             Self::GuestCall(call) => f.debug_tuple("GuestCall").field(call).finish(),
             Self::WorkerFunction(_) => f.debug_tuple("WorkerFunction").finish(),
         }
@@ -1305,6 +1306,17 @@ impl<T> StoreContextMut<'_, T> {
             }
             WorkItem::ResumeFiber(fiber) => {
                 self.0.resume_fiber(fiber).await?;
+            }
+            WorkItem::ResumeThread(thread) => {
+                let state = mem::replace(
+                    &mut self.0.concurrent_state_mut().get_mut(thread.thread)?.state,
+                    GuestThreadState::Running,
+                );
+                if let GuestThreadState::Pending(fiber) = state {
+                    self.0.resume_fiber(fiber).await?;
+                } else {
+                    bail!("thread {:?} not pending", thread);
+                }
             }
             WorkItem::GuestCall(call) => {
                 if call.is_ready(self.0)? {
@@ -3258,8 +3270,11 @@ impl Instance {
                 log::trace!("resuming thread {thread_id:?} that was waiting");
                 // Resuming a thread that is waiting is a no-op; it will resume when the wait completes.
             }
+            GuestThreadState::Running => {
+                bail!("cannot resume thread that is already running");
+            }
             _ => {
-                bail!("cannot resume thread which is completed or already running");
+                bail!("cannot resume thread that is completed");
             }
         }
         Ok(())
