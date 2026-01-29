@@ -1437,7 +1437,7 @@ fn thread_resume_later(
     caller_instance: u32,
     thread_idx: u32,
 ) -> Result<()> {
-    instance.resume_suspended_thread(
+    instance.resume_thread(
         store,
         RuntimeComponentInstanceIndex::from_u32(caller_instance),
         thread_idx,

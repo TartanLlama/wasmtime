@@ -3223,7 +3223,7 @@ impl Instance {
         self.add_guest_thread_to_instance_table(thread_id, store.0, runtime_instance)
     }
 
-    pub(crate) fn resume_suspended_thread(
+    pub(crate) fn resume_thread(
         self,
         store: &mut StoreOpaque,
         runtime_instance: RuntimeComponentInstanceIndex,
@@ -3235,6 +3235,7 @@ impl Instance {
         let state = store.concurrent_state_mut();
         let guest_thread = QualifiedThreadId::qualify(state, thread_id)?;
         let thread = state.get_mut(guest_thread.thread)?;
+        log::trace!("resuming thread {guest_thread:?} with state {:?}", thread.state);
 
         match mem::replace(&mut thread.state, GuestThreadState::Running) {
             GuestThreadState::NotStartedExplicit(start_func) => {
@@ -3311,6 +3312,20 @@ impl Instance {
     ) -> Result<WaitResult> {
         self.id().get(store).check_may_leave(caller)?;
 
+        log::trace!(
+            "{} called by {:?}{}",
+            if yielding {
+                "thread.yield"
+            } else {
+                "thread.suspend"
+            },
+            store.concurrent_state_mut().guest_thread.unwrap(),
+            match to_thread {
+                Some(idx) => format!(" to thread {}", idx),
+                None => "".into(),
+            }
+        );
+
         if to_thread.is_none() {
             let state = store.concurrent_state_mut();
             if yielding {
@@ -3335,7 +3350,7 @@ impl Instance {
         }
 
         if let Some(thread) = to_thread {
-            self.resume_suspended_thread(store, caller, thread, true)?;
+            self.resume_thread(store, caller, thread, true)?;
         }
 
         let state = store.concurrent_state_mut();
@@ -3609,7 +3624,6 @@ impl Instance {
         caller: RuntimeComponentInstanceIndex,
         slot: u32,
     ) -> Result<u32> {
-        self.id().get(store).check_may_leave(caller)?;
         store.concurrent_state_mut().context_get(slot)
     }
 
@@ -3620,7 +3634,6 @@ impl Instance {
         slot: u32,
         value: u32,
     ) -> Result<()> {
-        self.id().get(store).check_may_leave(caller)?;
         store.concurrent_state_mut().context_set(slot, value)
     }
 }
@@ -4236,6 +4249,21 @@ enum GuestThreadState {
     Waiting,
     Completed,
 }
+
+impl std::fmt::Debug for GuestThreadState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            GuestThreadState::NotStartedImplicit => write!(f, "NotStartedImplicit"),
+            GuestThreadState::NotStartedExplicit(_) => write!(f, "NotStartedExplicit"),
+            GuestThreadState::Running => write!(f, "Running"),
+            GuestThreadState::Suspended(_) => write!(f, "Suspended"),
+            GuestThreadState::Pending(_) => write!(f, "Pending"),
+            GuestThreadState::Waiting => write!(f, "Waiting"),
+            GuestThreadState::Completed => write!(f, "Completed"),
+        }
+    }
+}
+
 pub struct GuestThread {
     /// Context-local state used to implement the `context.{get,set}`
     /// intrinsics.
